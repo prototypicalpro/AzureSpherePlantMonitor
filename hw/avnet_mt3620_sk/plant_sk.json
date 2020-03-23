@@ -1,0 +1,34 @@
+{
+    "Metadata": {
+        "Type": "Azure Sphere Hardware Definition",
+        "Version": 1
+    },
+    "Description":
+    {
+        "Name": "Sample hardware abstraction for Avnet MT3620 SK",
+        "MainCoreHeaderFileTopContent": [
+            "/* Copyright (c) Microsoft Corporation. All rights reserved.",
+            "   Licensed under the MIT License. */",
+            "",
+            "// This file defines the mapping from the Avnet MT3620 Starter Kit (SK) to the",
+            "// 'sample hardware' abstraction used by the samples at https://github.com/Azure/azure-sphere-samples.",
+            "// Some peripherals are on-board on the Avnet MT3620 SK, while other peripherals must be attached externally if needed."
+        ]
+    },
+    "Imports" : [ {"Path": "avnet_mt3620_sk.json"} ],
+    "Peripherals": [
+        {"Name": "BUTTON_1", "Type": "Gpio", "Mapping": "AVNET_MT3620_SK_USER_BUTTON_A", "Comment": "MT3620 SK: User Button A."},
+        {"Name": "BUTTON_2", "Type": "Gpio", "Mapping": "AVNET_MT3620_SK_USER_BUTTON_B", "Comment": "MT3620 SK: User Button B."},
+        {"Name": "STATUS_PWM_CONTROLLER", "Type": "Pwm", "Mapping": "AVNET_MT3620_SK_PWM_CONTROLLER1", "Comment": "MT3620 SK: PWM LED controller for status LEDs"},
+        {"Name": "APP_STATUS_PWM_CHANNEL", "Type": "int", "Mapping": "MT3620_PWM_CHANNEL0", "Comment": "MT3620 SK: Channel 0 for app status LED"},
+        {"Name": "WLAN_STATUS_PWM_CHANNEL", "Type": "int", "Mapping": "MT3620_PWM_CHANNEL1", "Comment": "MT3620 SK: Channel 1 for WLAN status LED"},
+        {"Name": "USER_PWM_CONTROLLER", "Type": "Pwm", "Mapping": "AVNET_MT3620_SK_PWM_CONTROLLER2", "Comment": "MT3620 SK: PWM LED controller for user LEDs"},
+        {"Name": "USER_LED_RED_PWM_CHANNEL", "Type": "int", "Mapping": "MT3620_PWM_CHANNEL0", "Comment": "MT3620 SK: User LED Red channel"},
+        {"Name": "USER_LED_GREEN_PWM_CHANNEL", "Type": "int", "Mapping": "MT3620_PWM_CHANNEL1", "Comment": "MT3620 SK: User LED Green channel"},
+        {"Name": "USER_LED_BLUE_PWM_CHANNEL", "Type": "int", "Mapping": "MT3620_PWM_CHANNEL2", "Comment": "MT3620 SK: User LED Blue channel"},
+        {"Name": "LIGHT_ADC_CONTROLLER", "Type": "Adc", "Mapping": "AVNET_MT3620_SK_ADC_CONTROLLER0", "Comment": "MT3620 SK: ADC Potentiometer controller"},
+        {"Name": "LIGHT_ADC_CHANNEL", "Type": "int", "Mapping": "MT3620_ADC_CHANNEL1", "Comment": "MT3620 SK: Connect external potentiometer to ADC controller 0, channel 1 using SOCKET1 AN. In the app manifest, it is only necessary to request the capability for the ADC Group Controller, SAMPLE_POTENTIOMETER_ADC_CONTROLLER."},
+        {"Name": "CLIMATE_I2C_CONTROLLER", "Type": "I2cMaster", "Mapping": "AVNET_AESMS_ISU2_I2C", "Comment": "ISU2 I2C is shared between GROVE Connector, OLED DISPLAY Connector, SOCKET1 and SOCKET2. On GROVE Connector: pin 15 (SDA) and pin 10 (SCL). On OLED Display connector: pin 4 (SDA) and pin 3 (SCL).On SOCKET1/2: SDA (SDA) and SCL (SCL)"},
+        {"Name": "UART", "Type": "Uart", "Mapping": "AVNET_MT3620_SK_ISU0_UART", "Comment": "MT3620 SK: Connect SOCKET1 RX (RX) to SOCKET1 TX (TX)."}
+    ]
+}

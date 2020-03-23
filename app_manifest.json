@@ -1,0 +1,19 @@
+﻿{
+  "SchemaVersion": 1,
+  "Name": "MyBlink",
+  "ComponentId": "e12bf6a0-3c19-4a6c-9883-9fff7e78f449",
+  "EntryPoint": "/bin/app",
+  "Capabilities": {
+    "Gpio": [ "$BUTTON_1", "$BUTTON_2" ],
+    "Pwm": [ "$USER_PWM_CONTROLLER", "$STATUS_PWM_CONTROLLER" ],
+    "Adc": [ "$LIGHT_ADC_CONTROLLER" ],
+    "I2cMaster": [ "$CLIMATE_I2C_CONTROLLER" ],
+    "SystemTime": true,
+    "AllowedConnections": [
+      "global.azure-devices-provisioning.net",
+      "PrototypicalPlantIoTHub.azure-devices.net"
+    ],
+    "DeviceAuthentication": "cf00126c-7cfe-4d5e-96df-0d0afea82832"
+  },
+  "ApplicationType": "Default"
+}

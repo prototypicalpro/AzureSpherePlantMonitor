@@ -1,5 +1,7 @@
-# AzureSpherePlantMonitor
-<img src="./readme/Board.jpg" alt="An AVNET MT3620 starter kit magnetically attached to a shelf" style="max-width:49%;"/> <img src="./readme/Sensor.jpg" alt="Chirp! soil moisture sensor attatched to a plant" style="max-width:49%;" />
+# Azure Sphere Plant Monitor
+
+| ![An AVNET MT3620 starter kit magnetically attached to a shelf](./readme/Board.jpg) | ![Chirp! soil moisture sensor attached to a plant](./readme/Sensor.jpg) |
+|:---:|:---:|
 
 A simple Azure Sphere app to periodically monitor and publish sensor data. Automatically polls data from two [chirp! soil moisture](https://github.com/Miceuz/i2c-moisture-sensor) sensors, a [SHT31D tempurature/humidity](https://www.adafruit.com/product/2857) sensor, and a [LPS22H pressure](https://www.st.com/en/mems-and-sensors/lps22hb.html) sensor through a [LSM5DSO Gyro](https://www.st.com/en/mems-and-sensors/lsm6dso.html). Data is then translated into a JSON package and uploaded through Azure IoT to an [Azure Function](https://github.com/prototypicalpro/LambdaWorkspace/tree/master/azureplant), which loads this data into a MongoDB. This program was built for the [AVNET Azure Sphere MT3620 Starter Kit](https://www.avnet.com/shop/us/products/avnet-engineering-services/aes-ms-mt3620-sk-g-3074457345636825680/), but should still operate on other hardware given correct configurations.
 

@@ -1,4 +1,4 @@
-# Azure Sphere Plant Monitor
+# Azure Sphere Plant Monitor (AKA Sprout)
 
 | ![An AVNET MT3620 starter kit magnetically attached to a shelf](./readme/Board.jpg) | ![Chirp! soil moisture sensor attached to a plant](./readme/Sensor.jpg) |
 |:---:|:---:|

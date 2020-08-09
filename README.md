@@ -14,3 +14,5 @@ I've deployed this project to monitor the climate and health of some houseplants
 Internally, this program uses [libeuv](https://github.com/troglobit/libuev) for thread-safe events and [C-Macro-Collections](https://github.com/LeoVen/C-Macro-Collections) for message queues. Sensors are polled every 2 minutes, and the resulting messages are uploaded ever 10 minutes. In the event of a network disconnection, messages are queued until the network is reconnected or the queue becomes full. A global state machine keeps track of the current network state, triggering reconnection attempts with exponential backoff on disconnection. Messages that fail to send due to the network disconnecting are re-queued in no particular order, and as a result the ordering of messages is not guarenteed (but can be reassembled using the message timestamp). 
 
 This setup has proven very reliable, as the current deployment has been running for 2 months now (3/23/2020) with no issues.
+
+![Pixel Tracker](https://track.prototypical.pro?source=github&repo=AzureSpherePlantMonitor)

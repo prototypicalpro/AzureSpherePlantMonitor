@@ -4,6 +4,9 @@
 cmake_minimum_required (VERSION 3.8)
 project (MyBlink C)
 
+azsphere_configure_tools(TOOLS_REVISION "20.07")
+azsphere_configure_api(TARGET_API_SET "6")
+
 # libuev
 add_subdirectory(extern/libeuv)
 

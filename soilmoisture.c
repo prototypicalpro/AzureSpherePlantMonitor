@@ -25,7 +25,6 @@ int SoilMoistureInit(int i2cfd) {
 	I2CMaster_SetTimeout(i2cfd, 500);
 	int ret = I2CMaster_WriteThenRead(i2cfd, soil_addr_1, &reg, 1, out.u8bit, 2);
 	swap(out.u8bit, out.u8bit + 1);
-	int err = errno;
 	if (ret < 0 || out.u16bit > 10000U)
 		Log_Debug("Soil sensor 1 not found!\n");
 	int ret2 = I2CMaster_WriteThenRead(i2cfd, soil_addr_2, &reg, 1, out.u8bit, 2);

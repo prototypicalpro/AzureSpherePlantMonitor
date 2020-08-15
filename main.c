@@ -158,6 +158,9 @@ static const char* GetReasonString(IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason
 {
 	static char* reasonString = "unknown reason";
 	switch (reason) {
+	case IOTHUB_CLIENT_CONNECTION_NO_PING_RESPONSE:
+		reasonString = "IOTHUB_CLIENT_CONNECTION_NO_PING_RESPONSE";
+		break;
 	case IOTHUB_CLIENT_CONNECTION_EXPIRED_SAS_TOKEN:
 		reasonString = "IOTHUB_CLIENT_CONNECTION_EXPIRED_SAS_TOKEN";
 		break;
@@ -305,7 +308,6 @@ int check_azure_rdy(uev_t* w, void* arg, int events) {
 			return 0;
 
 		const int timeout = 20;
-		bool urlEncodeOn = true;
 		if (IoTHubDeviceClient_LL_SetOption(data->iot_handle, OPTION_KEEP_ALIVE, &timeout) != IOTHUB_CLIENT_OK) {
 			Log_Debug("ERROR: failure setting option \"%s\"\n", OPTION_KEEP_ALIVE);
 			return -1;
@@ -345,7 +347,6 @@ void upload_data(uev_t* w, void* arg, int events) {
 	Log_Debug("upload_data called\n");
 
 	if (UEV_ERROR == events) {
-		int err = errno;
 		Log_Debug("Error in upload_data event\n");
 		uev_timer_stop(data->upload_timer_w);
 		terminationRequired = true;
@@ -413,7 +414,6 @@ void poll_sensors(uev_t* w, void* arg, int events) {
 	on_net_rdy_t* data = (on_net_rdy_t*)arg;
 
 	if (UEV_ERROR == events) {
-		int err = errno;
 		Log_Debug("Error in poll_sensors event\n");
 		uev_timer_stop(data->poll_sensors_w);
 		struct timespec now;

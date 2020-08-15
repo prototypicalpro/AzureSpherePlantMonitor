@@ -23,17 +23,6 @@ static handle_ctx_t press_handle_ctx = {
 	(LPS22HH_I2C_ADD_L & 0xFEU) >> 1
 };
 
-static void HAL_Delay(const time_t msec) {
-	struct timespec time;
-	time.tv_nsec = (msec % 1000) * 1000000;
-	time.tv_sec = msec / 1000;
-	nanosleep(&time, NULL);
-}
-
-static uint16_t min(uint16_t a, uint16_t b) {
-	return a < b ? a : b;
-}
-
 /*
  * @brief  Write generic device register (platform dependent)
  *

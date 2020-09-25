@@ -44,6 +44,7 @@ int HumidityMeasure(humidity_data_t* data_out) {
 	uint8_t out[6];
 	int ret = I2CMaster_WriteThenRead(humid_fd, humid_addr, fetch_cmd, sizeof(fetch_cmd), out, sizeof(out));
 	if (ret < 0) {
+		int err = errno;
 		Log_Debug("Failed to read humid\n");
 		data_out->humidity = 0;
 		return -1;

@@ -77,11 +77,27 @@ typedef struct {
 	uev_ctx_t* ctx;
 	uev_t* move_state_w, * upload_timer_w, * poll_sensors_w;
 	fd_t* fds;
-	pulse_t* wlan_pulse, * app_pulse;
+	// pulse_t* wlan_pulse, * app_pulse;
 	poll_t* net_rdy_poll, * azure_rdy_poll;
 	IOTHUB_DEVICE_CLIENT_LL_HANDLE iot_handle;
 	const char* iot_scope_id;
 } on_net_rdy_t;
+
+void set_indicator_color(int PWMfd, unsigned int red, unsigned int green, unsigned int blue) {
+	PwmState state;
+	state.enabled = true;
+	state.dutyCycle_nsec = 0;
+	state.period_nsec = 255000;
+	state.polarity = PWM_Polarity_Inversed;
+
+	state.dutyCycle_nsec = red * 100;
+	PWM_Apply(PWMfd, USER_LED_RED_PWM_CHANNEL, &state);
+	int err = errno;
+	state.dutyCycle_nsec = green * 100;
+	PWM_Apply(PWMfd, USER_LED_GREEN_PWM_CHANNEL, &state);
+	state.dutyCycle_nsec = blue * 100;
+	PWM_Apply(PWMfd, USER_LED_BLUE_PWM_CHANNEL, &state);
+}
 
 // TODO: ensure atomic state transitions to avoid doubling events
 void move_state(uev_t* w, void* arg, int events) {
@@ -97,12 +113,12 @@ void move_state(uev_t* w, void* arg, int events) {
 			// depending on the next state, start the operation
 			if (desired_state == STATE_IDLE) {
 				Log_Debug("Idling for data...");
+				set_indicator_color(data->fds->User_PWM, 255, 0, 0);
 			}
 			else if (desired_state == STATE_NO_NETWORK) {
 				// turn off the timer for the wlan light, and set the light solid
-				// pulse_start(data->ctx, data->wlan_pulse);
-				// pulse_stop(data->app_pulse, false);
 				Log_Debug("Internet down!\n");
+				set_indicator_color(data->fds->User_PWM, 0, 255, 0);
 				// start checking our connection to azure services
 				poll_start(data->ctx, data->net_rdy_poll);
 			}
@@ -111,6 +127,7 @@ void move_state(uev_t* w, void* arg, int events) {
 				// pulse_stop(data->wlan_pulse, true);
 				// pulse_start(data->ctx, data->app_pulse);
 				Log_Debug("Internet connected!\n");
+				set_indicator_color(data->fds->User_PWM, 255, 128, 0);
 				// start checking our connection to azure services
 				poll_start(data->ctx, data->azure_rdy_poll);
 			}
@@ -118,6 +135,7 @@ void move_state(uev_t* w, void* arg, int events) {
 				Log_Debug("On Azure Ready called!\n");
 				// pulse_stop(data->app_pulse, true);
 				// pulse_stop(data->wlan_pulse, true);
+				set_indicator_color(data->fds->User_PWM, 0, 255, 0);
 				uev_timer_set(data->upload_timer_w, 1, 1000 * upload_interval);
 				uev_timer_start(data->upload_timer_w);
 			}
@@ -492,7 +510,7 @@ void do_work(uev_t* w, void* arg, int events) {
 int main(void)
 {
 	fd_t fds;
-	pulse_t app_pulse, wlan_pulse;
+	// pulse_t app_pulse, wlan_pulse;
 	uev_ctx_t ctx;
 	uev_t sigterm_watcher, state_change_watcher, upload_timer_watcher, poll_sensors_watcher, do_work_watcher;
 	poll_t net_rdy_poll, azure_rdy_poll;
@@ -508,15 +526,15 @@ int main(void)
 	OpenPeripherals(&fds);
 
 	// configure events
-	// pulse_configure(&app_pulse, fds.Status_PWM, APP_STATUS_PWM_CHANNEL, 100000, 80000, 5000, 50);
-	// pulse_configure(&wlan_pulse, fds.Status_PWM, WLAN_STATUS_PWM_CHANNEL, 100000, 80000, 5000, 50);
+	// pulse_configure(&app_pulse, fds.Status_PWM, APP_STATUS_PWM_CHANNEL, 100000, 80000, 5000, 100);
+	// pulse_configure(&wlan_pulse, fds.Status_PWM, WLAN_STATUS_PWM_CHANNEL, 100000, 80000, 5000, 100);
 	on_net_rdy_arg.ctx = &ctx;
 	on_net_rdy_arg.move_state_w = &state_change_watcher;
 	on_net_rdy_arg.upload_timer_w = &upload_timer_watcher;
 	on_net_rdy_arg.poll_sensors_w = &poll_sensors_watcher;
 	on_net_rdy_arg.fds = &fds;
-	on_net_rdy_arg.app_pulse = &app_pulse;
-	on_net_rdy_arg.wlan_pulse = &wlan_pulse;
+	// on_net_rdy_arg.app_pulse = &app_pulse;
+	// on_net_rdy_arg.wlan_pulse = &wlan_pulse;
 	on_net_rdy_arg.net_rdy_poll = &net_rdy_poll;
 	on_net_rdy_arg.azure_rdy_poll = &azure_rdy_poll;
 	on_net_rdy_arg.iot_handle = NULL;

@@ -1,8 +1,9 @@
-﻿{
+{
   "SchemaVersion": 1,
-  "Name": "MyBlink",
-  "ComponentId": "e12bf6a0-3c19-4a6c-9883-9fff7e78f449",
+  "Name": "PlantMonitor",
+  "ComponentId": "a6fd505b-879d-4988-8bbb-b63b05e9448b",
   "EntryPoint": "/bin/app",
+  "CmdArgs": [],
   "Capabilities": {
     "Gpio": [ "$BUTTON_1", "$BUTTON_2" ],
     "Pwm": [ "$USER_PWM_CONTROLLER", "$STATUS_PWM_CONTROLLER" ],
@@ -10,8 +11,7 @@
     "I2cMaster": [ "$CLIMATE_I2C_CONTROLLER" ],
     "SystemTime": true,
     "AllowedConnections": [
-      "global.azure-devices-provisioning.net",
-      "PrototypicalPlantIoTHub.azure-devices.net"
+      "plantmonitor.azure-devices.net"
     ],
     "DeviceAuthentication": "cf00126c-7cfe-4d5e-96df-0d0afea82832"
   },

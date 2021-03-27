@@ -1,3 +1,3 @@
 [submodule "extern/C-Macro-Collections"]
 	path = extern/C-Macro-Collections
-	url = https://github.com/LeoVen/C-Macro-Collections
+	url = git@github.com:LeoVen/C-Macro-Collections.git

@@ -1,575 +1,693 @@
-﻿#include <stdbool.h>
+﻿// This minimal Azure Sphere app repeatedly toggles an LED. Use this app to test that
+// installation of the device and SDK succeeded, and that you can build, deploy, and debug an app.
+
+#include <stdbool.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
 #include <signal.h>
+#include <sys/eventfd.h>
+#include <pthread.h>
 
 #include <applibs/log.h>
 #include <applibs/gpio.h>
-#include <applibs/adc.h>
 #include <applibs/pwm.h>
-#include <applibs/networking.h>
-#include <applibs/storage.h>
-#include <applibs/rtc.h>
 #include <applibs/i2c.h>
-
-#include <azureiot/iothub_client_core_common.h>
-#include <azureiot/iothub_device_client_ll.h>
-#include <azureiot/iothub_client_options.h>
-#include <azureiot/iothubtransportmqtt.h>
-#include <azureiot/iothub.h>
-#include <azureiot/azure_sphere_provisioning.h>
-
-#include <uev.h>
-#include <sac/queue.h>
-
-// By default, this sample's CMake build targets hardware that follows the MT3620
-// Reference Development Board (RDB) specification, such as the MT3620 Dev Kit from
-// Seeed Studios.
-//
-// To target different hardware, you'll need to update the CMake build. The necessary
-// steps to do this vary depending on if you are building in Visual Studio, in Visual
-// Studio Code or via the command line.
-//
-// See https://github.com/Azure/azure-sphere-samples/tree/master/Hardware for more details.
+#include <applibs/adc.h>
+#include <applibs/networking.h>
+#include <applibs/eventloop.h>
 #include <hw/plant_sk.h>
 
-#include "pulse.h"
-#include "poll.h"
+#include <iothub_client_core_common.h>
+#include <iothub_device_client_ll.h>
+#include <iothub_client_options.h>
+#include <iothubtransportmqtt.h>
+#include <iothub.h>
+#include <azure_sphere_provisioning.h>
+#include <iothub_security_factory.h>
+#include <shared_util_options.h>
+
+#include <macro_collections.h>
+
+#include "event_loop_event.h"
+#include "event_loop_timer.h"
 #include "climatesensor.h"
-#include "soilmoisture.h"
+#include "chirp.h"
 #include "humidity.h"
 
-#include <pthread.h>
+/// Constants
+const char IotHubHostname[] = "plantmonitor.azure-devices.net";
+const char PacketFmt[] = "{\"meta\":{\"time\":%d,\"name\":\"plant0\"},\"data\":{\"lux\":%f,\"climate\":{\"tempurature\":%f,\"pressure\":%f,\"samples\":%d},\"soil\":{\"0x24\":%hu,\"0x26\":%hu},\"humidity\":%f}}";
+const struct timespec UploadInterval = { .tv_sec = 600, .tv_nsec = 0 }; // TODO: every ten minutes
+const struct timespec SampleInterval = { .tv_sec = 120, .tv_nsec = 0 }; // TODO: every two minutes
+const struct timespec NetPollInterval = { .tv_sec = 5, .tv_nsec = 0 };
+const struct timespec AzureAuthPollInterval = { .tv_sec = 30, .tv_nsec = 0 };
+const struct timespec IoTDoWorkInterval = { .tv_sec = 0, .tv_nsec = 5e7 }; // 50 milliseconds
+const struct timespec SoonInterval = { .tv_sec = 0, .tv_nsec = 1 };
+const size_t PacketMaxBytes = 256;
+const size_t QueueMaxCapacity = 50;
+
+typedef enum {
+    State_Entry = 0,
+    State_NoNetwork = 1,
+    State_AzureAuth = 2,
+    State_PeriodicUpload = 3
+} MonitorState_t;
+
+const char* str_monitor_state(MonitorState_t state) {
+    switch (state) {
+    case State_Entry: return "State_Entry";
+    case State_NoNetwork: return "State_NoNetwork";
+    case State_AzureAuth: return "State_AzureAuth";
+    case State_PeriodicUpload: return "State_PeriodicUpload";
+    default: return "Unknown";
+    }
+}
+
+typedef enum {
+    ExitCode_Success = 0,
+
+    ExitCode_EventLoop_Create = 1,
+    ExitCode_ConsumeEventLoopTimerEvent = 3,
+    ExitCode_ConsumeEventLoopEvent = 4,
+    ExitCode_CreateEventLoopEvent_Panic = 5,
+    ExitCode_CreateEventLoopEvent_StateTransition = 5,
+    ExitCode_CreateEventLoopDisarmedTimer_NetRdy = 7,
+    ExitCode_CreateEventLoopDisarmedTimer_AzureAuth = 8,
+    ExitCode_CreateEventLoopDisarmedTimer_Upload = 28,
+    ExitCode_CreateEventLoopDisarmedTimer_DoWork = 27,
+    ExitCode_CreateEventLoopPeriodicTimer_Sample = 9,
+    ExitCode_UnknownState = 10,
+    ExitCode_Networking_GetInterfaceConnectionStatus = 11,
+    ExitCode_iothub_security_init = 12,
+    ExitCode_deque_new_outbound = 13,
+    ExitCode_deque_new_in_flight = 14,
+    ExitCode_EventLoopFail = 15,
+
+    ExitCode_QueueOverfill = 16,
+    ExitCode_QueueingFailed = 17,
+    ExitCode_malloc_fail = 18,
+    ExitCode_lock_fail = 19,
+
+    ExitCode_I2CMaster_Open_Climate = 20,
+    ExitCode_I2CMaster_SetBusSpeed_Climate = 21,
+    ExitCode_I2CMaster_SetTimeout_Climate = 22,
+
+    ExitCode_ADC_Open = 23,
+    ExitCode_ADC_SetReferenceVoltage = 24,
+
+    ExitCode_PWM_Open_Status = 25,
+    ExitCode_PWM_Open_User = 26,
+
+    ExitCode_SigTerm = 254,
+} ExitCode;
+
+#define DEQUE_PARAMS (deque, deque, QUEUE_MAX, , IOTHUB_MESSAGE_HANDLE)
+C_MACRO_COLLECTIONS_EXTENDED(CMC, DEQUE, DEQUE_PARAMS, )
+
+typedef struct deque deque_t;
+typedef struct deque_iter deque_iter_t;
 
 typedef struct {
-	int ADC;
-	int I2cClimate;
-	int Status_PWM;
-	int User_PWM;
+    int adc;
+    int i2c_climate;
+    int status_pwm;
+    int user_pwm;
 } fd_t;
 
-/// Constants
-const char iot_scope_id[] = "0ne000A8C6B";
-const char data_fmt[] = "{\"meta\":{\"time\":%d,\"name\":\"plant0\"},\"data\":{\"lux\":%f,\"climate\":{\"tempurature\":%f,\"pressure\":%f,\"samples\":%d},\"soil\":{\"0x24\":%hu,\"0x26\":%hu},\"humidity\":%f}}";
-const time_t upload_interval = 600;
-const time_t sample_interval = 120;
-const size_t packet_max = 256;
-#define QUEUE_MAX 25U
-
-/// Packet Management
-static volatile sig_atomic_t terminationRequired = false;
-#define STATE_NO_NETWORK 0
-#define STATE_NO_CREDS 1
-#define STATE_PERIODIC_UPLOAD 2
-#define STATE_IDLE 3
-
-static volatile sig_atomic_t cur_state = 0;
-static volatile sig_atomic_t desired_state = 0;
-
-SAC_QUEUE_GENERATE(q, queue_t, static, char*, QUEUE_MAX);
-queue_t pkt_to_send_queue;
-queue_t pkt_sent_queue;
-pthread_mutex_t pkt_queue_lock;
-pthread_mutex_t state_transition_lock;
+typedef struct {
+    climate_t climate;
+    humidity_t humidity;
+    chirp_t soil_moisture_1;
+    chirp_t soil_moisture_2;
+    fd_t fds;
+} sensors_t;
 
 typedef struct {
-	uev_ctx_t* ctx;
-	uev_t* move_state_w, * upload_timer_w, * poll_sensors_w;
-	fd_t* fds;
-	// pulse_t* wlan_pulse, * app_pulse;
-	poll_t* net_rdy_poll, * azure_rdy_poll;
-	IOTHUB_DEVICE_CLIENT_LL_HANDLE iot_handle;
-	const char* iot_scope_id;
-} on_net_rdy_t;
+    climate_data_t climate_data;
+    humidity_data_t humidity_data;
+    chirp_data_t soil_1_data;
+    chirp_data_t soil_2_data;
+    float lux;
+} sensor_values_t;
+
+typedef struct {
+    pthread_mutex_t pkt_queues_lock;
+    deque_t* pkt_outbound;
+    deque_t* pkt_in_flight;
+
+    EventLoop* loop;
+    EventLoopEvent_t* sigterm_event;
+    EventLoopEvent_t* state_transition_event;
+    EventLoopTimer* no_network_timer;
+    EventLoopTimer* azure_auth_timer;
+    EventLoopTimer* upload_timer;
+    EventLoopTimer* dowork_timer;
+    EventLoopTimer* sample_timer;
+    IOTHUB_DEVICE_CLIENT_LL_HANDLE iothub_handle;
+    sensors_t sensors;
+
+    MonitorState_t cur_state;
+    MonitorState_t requested_state;
+
+    ExitCode last_thread_exit_code;
+} application_state_t;
+
+// Global Variables
+volatile EventLoopEvent_t* sigterm_event = NULL;
+
+// functions
+void clear_fds(fd_t* fds) {
+    fds->adc = -1;
+    fds->i2c_climate = -1;
+    fds->status_pwm = -1;
+    fds->user_pwm = -1;
+}
+
+void init_sensors(sensors_t* sensors) {
+    memset(sensors, 0, sizeof(*sensors));
+    clear_fds(&sensors->fds);
+}
+
+void zero_application_state(application_state_t* app_state) {
+    memset(app_state, 0, sizeof(*app_state));
+
+    app_state->last_thread_exit_code = ExitCode_Success;
+    app_state->cur_state = State_Entry;
+    app_state->requested_state = State_Entry;
+
+    init_sensors(&app_state->sensors);
+}
+
+ExitCode start_system_devices(fd_t* fds) {
+    if ((fds->adc = ADC_Open(LIGHT_ADC_CONTROLLER)) < 0)
+        return ExitCode_ADC_Open;
+    if (ADC_SetReferenceVoltage(fds->adc, LIGHT_ADC_CHANNEL, 2.5f) < 0)
+        return ExitCode_ADC_SetReferenceVoltage;
+
+    if ((fds->i2c_climate = I2CMaster_Open(CLIMATE_I2C_CONTROLLER)) < 0)
+        return ExitCode_I2CMaster_Open_Climate;
+    if (I2CMaster_SetBusSpeed(fds->i2c_climate, I2C_BUS_SPEED_STANDARD) < 0)
+        return ExitCode_I2CMaster_SetBusSpeed_Climate;
+    if (I2CMaster_SetTimeout(fds->i2c_climate, 100) < 0)
+        return ExitCode_I2CMaster_SetTimeout_Climate;
+
+    PwmState state;
+    state.enabled = true;
+    state.dutyCycle_nsec = 0;
+    state.period_nsec = 100000;
+    state.polarity = PWM_Polarity_Inversed;
+    if ((fds->status_pwm = PWM_Open(STATUS_PWM_CONTROLLER)) < 0)
+        return ExitCode_PWM_Open_Status;
+    PWM_Apply(fds->status_pwm, APP_STATUS_PWM_CHANNEL, &state);
+    PWM_Apply(fds->status_pwm, WLAN_STATUS_PWM_CHANNEL, &state);
+    if ((fds->user_pwm = PWM_Open(USER_PWM_CONTROLLER)) < 0)
+        return ExitCode_PWM_Open_User;
+    PWM_Apply(fds->user_pwm, USER_LED_RED_PWM_CHANNEL, &state);
+    PWM_Apply(fds->user_pwm, USER_LED_GREEN_PWM_CHANNEL, &state);
+    PWM_Apply(fds->user_pwm, USER_LED_BLUE_PWM_CHANNEL, &state);
+    
+    return ExitCode_Success;
+}
+
+void stop_system_devices(fd_t* fds) {
+    if (fds->adc != -1)
+        close(fds->adc);
+    if (fds->i2c_climate != -1)
+        close(fds->i2c_climate);
+    if (fds->status_pwm != -1)
+        close(fds->status_pwm);
+    if (fds->user_pwm != -1)
+        close(fds->user_pwm);
+}
+
+void start_or_restart_sensors(sensors_t* sensors) {
+    if (!ClimateSensorIsOk(&sensors->climate) && ClimateSensorInit(&sensors->climate, sensors->fds.i2c_climate) < 0)
+        Log_Debug("Failed to initialize climate sensor\n");
+    if (!ChirpIsOk(&sensors->soil_moisture_1) && ChirpInit(&sensors->soil_moisture_1, sensors->fds.i2c_climate, CHIRP_ADDR_1) < 0)
+        Log_Debug("Failed to initialize soil moisture 1\n");
+    if (!ChirpIsOk(&sensors->soil_moisture_2) && ChirpInit(&sensors->soil_moisture_2, sensors->fds.i2c_climate, CHIRP_ADDR_2) < 0)
+        Log_Debug("Failed to initialize soil moisture 2\n");
+    if (!HumidityIsOk(&sensors->humidity) && HumidityInit(&sensors->humidity, sensors->fds.i2c_climate) < 0)
+        Log_Debug("Failed to initialize humidity sensor\n");
+}
+
+sensor_values_t sample_sensors(sensors_t* sensors) {
+    sensor_values_t ret = { 0 };
+    ClimateSensorMeasure(&sensors->climate, &ret.climate_data);
+    HumidityMeasure(&sensors->humidity, &ret.humidity_data);
+    ChirpMeasure(&sensors->soil_moisture_1, &ret.soil_1_data);
+    ChirpMeasure(&sensors->soil_moisture_2, &ret.soil_2_data);
+    
+    uint32_t adc_value;
+    int err = ADC_Poll(sensors->fds.adc, LIGHT_ADC_CHANNEL, &adc_value);
+    if (!err) 
+        ret.lux = (2.5f * (float)adc_value / 4095.0f) * 1000000.0f / (3650.0f * 0.1428f);
+    else 
+        ret.lux = 0;
+
+    return ret;
+}
+
+IOTHUB_MESSAGE_HANDLE serialize_sensor_data(const sensor_values_t* values, const struct timespec* time) {
+    char pkt[PacketMaxBytes];
+    int res = snprintf(pkt, PacketMaxBytes, PacketFmt,
+        time->tv_sec,
+        values->lux,
+        values->climate_data.avg_tempurature,
+        values->climate_data.avg_pressure,
+        values->climate_data.num_samples,
+        values->soil_1_data.soil_moisture,
+        values->soil_2_data.soil_moisture,
+        values->humidity_data.humidity);
+
+    if (res < 0) {
+        Log_Debug("Failed to serialize sensor readings");
+        return NULL;
+    }
+
+    return IoTHubMessage_CreateFromString(pkt);
+}
+
+ExitCode start_peripherals(application_state_t* app_state) {
+    ExitCode ret = start_system_devices(&app_state->sensors.fds);
+    if (ret != ExitCode_Success)
+        return ret;
+    start_or_restart_sensors(&app_state->sensors);
+    return ExitCode_Success;
+}
 
 void set_indicator_color(int PWMfd, unsigned int red, unsigned int green, unsigned int blue) {
-	PwmState state;
-	state.enabled = true;
-	state.dutyCycle_nsec = 0;
-	state.period_nsec = 255000;
-	state.polarity = PWM_Polarity_Inversed;
+    PwmState state;
+    state.enabled = true;
+    state.dutyCycle_nsec = 0;
+    state.period_nsec = 255000;
+    state.polarity = PWM_Polarity_Inversed;
 
-	state.dutyCycle_nsec = red * 100;
-	PWM_Apply(PWMfd, USER_LED_RED_PWM_CHANNEL, &state);
-	int err = errno;
-	state.dutyCycle_nsec = green * 100;
-	PWM_Apply(PWMfd, USER_LED_GREEN_PWM_CHANNEL, &state);
-	state.dutyCycle_nsec = blue * 100;
-	PWM_Apply(PWMfd, USER_LED_BLUE_PWM_CHANNEL, &state);
+    state.dutyCycle_nsec = red * 100;
+    PWM_Apply(PWMfd, USER_LED_RED_PWM_CHANNEL, &state);
+    state.dutyCycle_nsec = green * 100;
+    PWM_Apply(PWMfd, USER_LED_GREEN_PWM_CHANNEL, &state);
+    state.dutyCycle_nsec = blue * 100;
+    PWM_Apply(PWMfd, USER_LED_BLUE_PWM_CHANNEL, &state);
 }
 
-// TODO: ensure atomic state transitions to avoid doubling events
-void move_state(uev_t* w, void* arg, int events) {
-	on_net_rdy_t* data = (on_net_rdy_t*)arg;
-
-	pthread_mutex_lock(&state_transition_lock); 
-	{
-		if (cur_state != desired_state) {
-			// cancel all things from previous states
-			uev_timer_stop(data->upload_timer_w);
-			poll_stop(data->net_rdy_poll);
-			poll_stop(data->azure_rdy_poll);
-			// depending on the next state, start the operation
-			if (desired_state == STATE_IDLE) {
-				Log_Debug("Idling for data...");
-				set_indicator_color(data->fds->User_PWM, 255, 0, 0);
-			}
-			else if (desired_state == STATE_NO_NETWORK) {
-				// turn off the timer for the wlan light, and set the light solid
-				Log_Debug("Internet down!\n");
-				set_indicator_color(data->fds->User_PWM, 0, 255, 0);
-				// start checking our connection to azure services
-				poll_start(data->ctx, data->net_rdy_poll);
-			}
-			else if (desired_state == STATE_NO_CREDS) {
-				// turn off the timer for the wlan light, and set the light solid
-				// pulse_stop(data->wlan_pulse, true);
-				// pulse_start(data->ctx, data->app_pulse);
-				Log_Debug("Internet connected!\n");
-				set_indicator_color(data->fds->User_PWM, 255, 128, 0);
-				// start checking our connection to azure services
-				poll_start(data->ctx, data->azure_rdy_poll);
-			}
-			else if (desired_state == STATE_PERIODIC_UPLOAD) {
-				Log_Debug("On Azure Ready called!\n");
-				// pulse_stop(data->app_pulse, true);
-				// pulse_stop(data->wlan_pulse, true);
-				set_indicator_color(data->fds->User_PWM, 0, 255, 0);
-				uev_timer_set(data->upload_timer_w, 1, 1000 * upload_interval);
-				uev_timer_start(data->upload_timer_w);
-			}
-			cur_state = desired_state;
-		}
-	}
-	pthread_mutex_unlock(&state_transition_lock);
+void app_panic(application_state_t* app, ExitCode code) {
+    app->last_thread_exit_code = code;
+    EventLoop_Stop(app->loop);
 }
 
-/// <summary>
-///     Converts AZURE_SPHERE_PROV_RETURN_VALUE to a string.
-/// </summary>
-static const char* getAzureSphereProvisioningResultString(
-	AZURE_SPHERE_PROV_RETURN_VALUE provisioningResult)
+void _app_request_transition(application_state_t* app, MonitorState_t next_state, int line, const char* func) {
+    // Log_Debug("%s:%i requesting to %s\n", func, line, str_monitor_state(next_state)); Uncomment for debugging, not threadsafe
+    app->requested_state = next_state;
+    PostEventLoopEvent(app->state_transition_event);
+}
+
+#define APP_REQUEST_TRANSITION(APP, NEXT_STATE) _app_request_transition(APP, NEXT_STATE, __LINE__, __func__)
+
+void handle_state_transition(EventLoopEvent_t* event, void* ctx) {
+    application_state_t* app_state = (application_state_t*)ctx;
+    eventfd_t out = 0;
+    int err = ConsumeEventLoopEvent(event, &out);
+    if (err) {
+        app_panic(app_state, ExitCode_ConsumeEventLoopEvent);
+        return;
+    }
+
+    Log_Debug("Got state transition %s with %i requests\n", str_monitor_state(app_state->requested_state), (int)out);
+    
+    if (app_state->cur_state != app_state->requested_state) {
+        Log_Debug("Transitioning from state %s to state %s\n", str_monitor_state(app_state->cur_state), str_monitor_state(app_state->requested_state));
+
+        // cancel all actions from previous states
+        DisarmEventLoopTimer(app_state->no_network_timer);
+        DisarmEventLoopTimer(app_state->azure_auth_timer);
+        DisarmEventLoopTimer(app_state->dowork_timer);
+        DisarmEventLoopTimer(app_state->upload_timer);
+
+        // TODO: zero length initial timer is hacky
+        switch (app_state->requested_state) {
+        case State_NoNetwork:
+            set_indicator_color(app_state->sensors.fds.user_pwm, 255, 0, 0);
+            SetEventLoopTimerPeriod(app_state->no_network_timer, &SoonInterval, &NetPollInterval);
+            break;
+        case State_AzureAuth:
+            set_indicator_color(app_state->sensors.fds.user_pwm, 255, 128, 0);
+            SetEventLoopTimerPeriod(app_state->azure_auth_timer, &SoonInterval, &AzureAuthPollInterval);
+            SetEventLoopTimerPeriod(app_state->dowork_timer, &SoonInterval, &IoTDoWorkInterval);
+            break;
+        case State_PeriodicUpload:
+            set_indicator_color(app_state->sensors.fds.user_pwm, 0, 255, 0);
+            SetEventLoopTimerPeriod(app_state->upload_timer, &SoonInterval, &UploadInterval);
+            SetEventLoopTimerPeriod(app_state->dowork_timer, &SoonInterval, &IoTDoWorkInterval);
+            break;
+        default:
+            app_panic(app_state, ExitCode_UnknownState);
+            return;
+        }
+
+        app_state->cur_state = app_state->requested_state;
+    }
+}
+
+void handle_no_network(EventLoopTimer* timer, void* ctx) {
+    application_state_t* app_state = (application_state_t*)ctx;
+    if (ConsumeEventLoopTimerEvent(timer) != 0) {
+        app_panic(app_state, ExitCode_ConsumeEventLoopTimerEvent);
+        return;
+    }
+
+    Networking_InterfaceConnectionStatus status;
+    if (Networking_GetInterfaceConnectionStatus("wlan0", &status) == 0) {
+        if (status & Networking_InterfaceConnectionStatus_ConnectedToInternet)
+            APP_REQUEST_TRANSITION(app_state, State_AzureAuth);
+    }
+    else if (errno != EAGAIN) {
+        app_panic(app_state, ExitCode_Networking_GetInterfaceConnectionStatus);
+        return;
+    }
+}
+
+void azure_status_cb_unsafe(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason, void* ctx)
 {
-	switch (provisioningResult.result) {
-	case AZURE_SPHERE_PROV_RESULT_OK:
-		return "AZURE_SPHERE_PROV_RESULT_OK";
-	case AZURE_SPHERE_PROV_RESULT_INVALID_PARAM:
-		return "AZURE_SPHERE_PROV_RESULT_INVALID_PARAM";
-	case AZURE_SPHERE_PROV_RESULT_NETWORK_NOT_READY:
-		return "AZURE_SPHERE_PROV_RESULT_NETWORK_NOT_READY";
-	case AZURE_SPHERE_PROV_RESULT_DEVICEAUTH_NOT_READY:
-		return "AZURE_SPHERE_PROV_RESULT_DEVICEAUTH_NOT_READY";
-	case AZURE_SPHERE_PROV_RESULT_PROV_DEVICE_ERROR:
-		return "AZURE_SPHERE_PROV_RESULT_PROV_DEVICE_ERROR";
-	case AZURE_SPHERE_PROV_RESULT_GENERIC_ERROR:
-		return "AZURE_SPHERE_PROV_RESULT_GENERIC_ERROR";
-	default:
-		return "UNKNOWN_RETURN_VALUE";
-	}
+    application_state_t* app_state = (application_state_t*)ctx;
+    if (result == IOTHUB_CLIENT_CONNECTION_UNAUTHENTICATED) {
+        if (reason == IOTHUB_CLIENT_CONNECTION_NO_NETWORK)
+            APP_REQUEST_TRANSITION(app_state, State_NoNetwork);
+        else 
+            APP_REQUEST_TRANSITION(app_state, State_AzureAuth);
+    }
+    if (result == IOTHUB_CLIENT_CONNECTION_AUTHENTICATED)
+        APP_REQUEST_TRANSITION(app_state, State_PeriodicUpload);
 }
 
-/// <summary>
-///     Converts the IoT Hub connection status reason to a string.
-/// </summary>
-static const char* GetReasonString(IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason)
+void handle_azure_auth(EventLoopTimer* timer, void* ctx) {
+    application_state_t* app_state = (application_state_t*)ctx;
+    if (ConsumeEventLoopTimerEvent(timer) != 0) {
+        app_panic(app_state, ExitCode_ConsumeEventLoopTimerEvent);
+        return;
+    }
+
+    if (app_state->iothub_handle != NULL) {
+        IoTHubDeviceClient_LL_Destroy(app_state->iothub_handle);
+        app_state->iothub_handle = NULL;
+    }
+
+    Networking_InterfaceConnectionStatus status;
+    if (Networking_GetInterfaceConnectionStatus("wlan0", &status) != 0) {
+        if (errno != EAGAIN)
+            app_panic(app_state, ExitCode_Networking_GetInterfaceConnectionStatus);
+        return;
+    }
+    if (!(status & Networking_InterfaceConnectionStatus_ConnectedToInternet)) {
+        APP_REQUEST_TRANSITION(app_state, State_NoNetwork);
+        return;
+    }
+
+    if (iothub_security_init(IOTHUB_SECURITY_TYPE_X509) != 0) {
+        app_panic(app_state, ExitCode_iothub_security_init);
+        return;
+    }
+    app_state->iothub_handle =
+        IoTHubDeviceClient_LL_CreateWithAzureSphereFromDeviceAuth(IotHubHostname, MQTT_Protocol);
+    if (app_state->iothub_handle == NULL) {
+        /// not going to panic here, instead retry
+        Log_Debug("IoTHubDeviceClient_LL_CreateFromDeviceAuth returned NULL.\n");
+    }
+    else {
+        int device_id_for_daa = 1;
+        if (IoTHubDeviceClient_LL_SetOption(app_state->iothub_handle, "SetDeviceId", &device_id_for_daa)  != IOTHUB_CLIENT_OK)
+            Log_Debug("Failure setting Azure IoT Hub client option \"SetDeviceId\".\n");
+        //bool url_encode_on = true;
+        //if (IoTHubDeviceClient_LL_SetOption(app_state->iothub_handle, OPTION_AUTO_URL_ENCODE_DECODE, &url_encode_on) != IOTHUB_CLIENT_OK)
+        //    Log_Debug("Failure setting Azure IoT Hub client option \"OPTION_AUTO_URL_ENCODE_DECODE\".\n");
+        if (IoTHubDeviceClient_LL_SetRetryPolicy(app_state->iothub_handle, IOTHUB_CLIENT_RETRY_INTERVAL, 30) != IOTHUB_CLIENT_OK)
+            Log_Debug("Failure setting Azure IoT Hub client retry policy.\n");
+        if (IoTHubDeviceClient_LL_SetConnectionStatusCallback(app_state->iothub_handle, azure_status_cb_unsafe, app_state) != IOTHUB_CLIENT_OK)
+            Log_Debug("Failure setting Azure IoT Hub client connection status callback.\n");
+    }
+
+    // asynchronously wait for azure status callback, or retry b/c it took too long
+    IoTHubDeviceClient_LL_DoWork(app_state->iothub_handle);
+
+    // cleanup
+    iothub_security_deinit();
+}
+
+void azure_send_cb_unsafe(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void* context)
 {
-	static char* reasonString = "unknown reason";
-	switch (reason) {
-	case IOTHUB_CLIENT_CONNECTION_NO_PING_RESPONSE:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_NO_PING_RESPONSE";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_EXPIRED_SAS_TOKEN:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_EXPIRED_SAS_TOKEN";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_DEVICE_DISABLED:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_DEVICE_DISABLED";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_BAD_CREDENTIAL:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_BAD_CREDENTIAL";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_RETRY_EXPIRED:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_RETRY_EXPIRED";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_NO_NETWORK:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_NO_NETWORK";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_COMMUNICATION_ERROR:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_COMMUNICATION_ERROR";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_OK:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_OK";
-		break;
-	}
-	return reasonString;
+    application_state_t* app_state = (application_state_t*)context;
+    
+    if (pthread_mutex_lock(&app_state->pkt_queues_lock)) {
+        app_panic(app_state, ExitCode_lock_fail);
+        return;
+    }
+
+    IOTHUB_MESSAGE_HANDLE maybe_sent = deque_front(app_state->pkt_in_flight);
+    deque_pop_front(app_state->pkt_in_flight);
+
+    if (result != IOTHUB_CLIENT_CONFIRMATION_OK) {
+        if (deque_count(app_state->pkt_outbound) >= QueueMaxCapacity) {
+            app_panic(app_state, ExitCode_QueueOverfill);
+            IoTHubMessage_Destroy(maybe_sent);
+        }
+        else if (!deque_push_back(app_state->pkt_outbound, maybe_sent)) {
+            app_panic(app_state, ExitCode_QueueingFailed);
+            IoTHubMessage_Destroy(maybe_sent);
+        }
+    }
+    else
+        IoTHubMessage_Destroy(maybe_sent);
+
+    pthread_mutex_unlock(&app_state->pkt_queues_lock);
 }
 
-void cleanup_exit(uev_t* w, void* arg, int events)
-{
-	if (UEV_ERROR != events)
-		terminationRequired = true;
-}
+void handle_upload(EventLoopTimer* timer, void* ctx) {
+    application_state_t* app_state = (application_state_t*)ctx;
+    if (ConsumeEventLoopTimerEvent(timer) != 0) {
+        app_panic(app_state, ExitCode_ConsumeEventLoopTimerEvent);
+        return;
+    }
 
-void OpenPeripherals(fd_t* fds) {
-	PwmState state;
-	state.enabled = true;
-	state.dutyCycle_nsec = 0;
-	state.period_nsec = 100000;
-	state.polarity = PWM_Polarity_Inversed;
+    if (pthread_mutex_lock(&app_state->pkt_queues_lock)) {
+        app_panic(app_state, ExitCode_lock_fail);
+        return;
+    }
 
-	if ((fds->ADC = ADC_Open(LIGHT_ADC_CONTROLLER)) < 0)
-		Log_Debug("Failed to open ADC\n");
-	if (ADC_SetReferenceVoltage(fds->ADC, LIGHT_ADC_CHANNEL, 2.5f) < 0)
-		Log_Debug("Failed to set ADC reference voltage\n");
+    while (!deque_empty(app_state->pkt_outbound) && deque_count(app_state->pkt_in_flight) < QueueMaxCapacity) {
+        IOTHUB_MESSAGE_HANDLE to_send = deque_front(app_state->pkt_outbound);
+        IOTHUB_CLIENT_RESULT res = IoTHubDeviceClient_LL_SendEventAsync(
+            app_state->iothub_handle, to_send, azure_send_cb_unsafe, app_state);
+        if (res != IOTHUB_CLIENT_OK) {
+            Log_Debug("Requesting IoTHub send failed with error %i\n", res);
+            APP_REQUEST_TRANSITION(app_state, State_NoNetwork);
+            goto cleanup;
+        }
 
-	if ((fds->I2cClimate = I2CMaster_Open(CLIMATE_I2C_CONTROLLER)) < 0)
-		Log_Debug("Failed to open I2C bus for climate sensor\n");
-	if (I2CMaster_SetBusSpeed(fds->I2cClimate, I2C_BUS_SPEED_STANDARD) < 0)
-		Log_Debug("Failed to set I2C bus speed\n");
-	if (I2CMaster_SetTimeout(fds->I2cClimate, 100) < 0)
-		Log_Debug("Failed to set I2C bust timeout\n");
-	if (ClimateSensorInit(fds->I2cClimate) < 0)
-		Log_Debug("Failed to initialize climate sensor\n");
-	if (SoilMoistureInit(fds->I2cClimate) < 0)
-		Log_Debug("Failed to initialize climate sensor\n");
-	if (HumidityInit(fds->I2cClimate) < 0)
-		Log_Debug("Failed to initialize humidity sensor\n");
+        Log_Debug("Sent message\n");
 
-	if((fds->Status_PWM = PWM_Open(STATUS_PWM_CONTROLLER)) < 0)
-		Log_Debug("Failed to open Status PWM\n");
-	else {
-		PWM_Apply(fds->Status_PWM, APP_STATUS_PWM_CHANNEL, &state);
-		PWM_Apply(fds->Status_PWM, WLAN_STATUS_PWM_CHANNEL, &state);
-	}
-	if ((fds->User_PWM = PWM_Open(USER_PWM_CONTROLLER)) < 0)
-		Log_Debug("Failed to open User PWM\n");
-	else {
-		PWM_Apply(fds->User_PWM, USER_LED_RED_PWM_CHANNEL, &state);
-		PWM_Apply(fds->User_PWM, USER_LED_GREEN_PWM_CHANNEL, &state);
-		PWM_Apply(fds->User_PWM, USER_LED_BLUE_PWM_CHANNEL, &state);
-	}
-}
+        deque_pop_front(app_state->pkt_outbound);
+        if (!deque_push_back(app_state->pkt_in_flight, to_send)) {
+            app_panic(app_state, ExitCode_QueueingFailed);
+            IoTHubMessage_Destroy(to_send);
+            goto cleanup;
+        }
+    }
 
-int check_net_rdy(uev_t* w, void* arg, int events) {
-	on_net_rdy_t* data = (on_net_rdy_t*)arg;
-	if (UEV_ERROR == events) {
-		Log_Debug("Error in on_net_rdy event\n");
-		return -1;
-	}
-	bool net_is_rdy = false;
-	if (Networking_IsNetworkingReady(&net_is_rdy) < 0) {
-		Log_Debug("Call to network failed\n");
-		return -1;
-	}
-	Log_Debug("Checked network!\n");
+    IoTHubDeviceClient_LL_DoWork(app_state->iothub_handle);
 
-	if (net_is_rdy) {
-		pthread_mutex_lock(&state_transition_lock);
-		{
-			desired_state = STATE_NO_CREDS;
-			uev_event_post(data->move_state_w);
-		}
-		pthread_mutex_unlock(&state_transition_lock);
-	}
-	return net_is_rdy ? 1 : 0;
-}
-
-void azure_status_cb(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason,
-	void* userContextCallback)
-{
-	on_net_rdy_t* data = (on_net_rdy_t*)userContextCallback;
-	int next_state = 0;
-	// TODO: add other enum values to if statements
-	if (result == IOTHUB_CLIENT_CONNECTION_UNAUTHENTICATED) {
-		if (reason == IOTHUB_CLIENT_CONNECTION_NO_NETWORK) {
-			// restart network polling, indicating as such
-			Log_Debug("No network callback?\n");
-			next_state = cur_state;
-		}
-		else if (reason == IOTHUB_CLIENT_CONNECTION_EXPIRED_SAS_TOKEN) {
-			// restart azure provisioning
-			next_state = STATE_NO_CREDS;
-		}
-	}
-	else if (result == IOTHUB_CLIENT_CONNECTION_AUTHENTICATED) {
-		// start sensor polling!
-		next_state = STATE_PERIODIC_UPLOAD;
-	}
-
-	pthread_mutex_lock(&state_transition_lock);
-	{
-		desired_state = next_state;
-		uev_event_post(data->move_state_w);
-	}
-	pthread_mutex_unlock(&state_transition_lock);
-}
-
-int check_azure_rdy(uev_t* w, void* arg, int events) {
-	// TODO: handle errors gracefully
-	if (UEV_ERROR == events)
-		Log_Debug("Error in check_azure_rdy event\n");
-	else {
-		on_net_rdy_t* data = (on_net_rdy_t*)arg;
-		if (data->iot_handle != NULL) {
-			IoTHubDeviceClient_LL_Destroy(data->iot_handle);
-			data->iot_handle = NULL;
-		}
-
-		AZURE_SPHERE_PROV_RETURN_VALUE provResult =
-			IoTHubDeviceClient_LL_CreateWithAzureSphereDeviceAuthProvisioning(data->iot_scope_id, 10000,
-				&data->iot_handle);
-		Log_Debug("IoTHubDeviceClient_LL_CreateWithAzureSphereDeviceAuthProvisioning returned '%s'.\n",
-			getAzureSphereProvisioningResultString(provResult));
-
-		if (provResult.result == AZURE_SPHERE_PROV_RESULT_PROV_DEVICE_ERROR
-			|| provResult.result == AZURE_SPHERE_PROV_RESULT_IOTHUB_CLIENT_ERROR
-			|| provResult.result == AZURE_SPHERE_PROV_RESULT_GENERIC_ERROR)
-			return -1;
-
-		if (provResult.result != AZURE_SPHERE_PROV_RESULT_OK)
-			return 0;
-
-		const int timeout = 20;
-		if (IoTHubDeviceClient_LL_SetOption(data->iot_handle, OPTION_KEEP_ALIVE, &timeout) != IOTHUB_CLIENT_OK) {
-			Log_Debug("ERROR: failure setting option \"%s\"\n", OPTION_KEEP_ALIVE);
-			return -1;
-		}
-
-		IoTHubDeviceClient_LL_SetRetryPolicy(data->iot_handle, IOTHUB_CLIENT_RETRY_INTERVAL, 30);
-		IoTHubDeviceClient_LL_SetConnectionStatusCallback(data->iot_handle, azure_status_cb, data);
-		return 1;
-	}
-	return -1;
-}
-
-void upload_msg_cb(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void* context) {
-	// if the result is good, deque from the sent queue
-	// else move back to the to_send queue, and post that the network is down
-	pthread_mutex_lock(&pkt_queue_lock);
-	{
-		char* pkt = q_peek(&pkt_sent_queue);
-		q_dequeue(&pkt_sent_queue);
-		if (result != IOTHUB_CLIENT_CONFIRMATION_OK) {
-			Log_Debug("Could not send! attempting retransmission...\n");
-			if (!q_enqueue(&pkt_to_send_queue, pkt)) {
-				Log_Debug("Out of memory when retransmitting!\n");
-				terminationRequired = true;
-			}
-		}
-		else {
-			free(pkt);
-		}
-	}
-	pthread_mutex_unlock(&pkt_queue_lock);
-}
-
-void upload_data(uev_t* w, void* arg, int events) {
-	on_net_rdy_t* data = (on_net_rdy_t*)arg;
-
-	Log_Debug("upload_data called\n");
-
-	if (UEV_ERROR == events) {
-		Log_Debug("Error in upload_data event\n");
-		uev_timer_stop(data->upload_timer_w);
-		terminationRequired = true;
-		return;
-	}
-	
-	// check the network status just to be sure
-	bool net_is_rdy = false;
-	if (Networking_IsNetworkingReady(&net_is_rdy) < 0) {
-		Log_Debug("Call to network failed\n");
-		return;
-	}
-
-	if (!net_is_rdy) {
-		Log_Debug("Network disconnected, cannot send data\n");
-		pthread_mutex_lock(&state_transition_lock);
-		{
-			desired_state = STATE_NO_NETWORK;
-			uev_event_post(data->move_state_w);
-		}
-		pthread_mutex_unlock(&state_transition_lock);
-		return;
-	}
-	
-	// lock the queue so we can manipulate it
-	pthread_mutex_lock(&pkt_queue_lock);
-	{
-		while (q_count(&pkt_to_send_queue) > 0) {
-			// for every item in the send queue, send the message!
-			char* buf = q_peek(&pkt_to_send_queue);
-			q_dequeue(&pkt_to_send_queue);
-			Log_Debug("Sending message:\"%s\"\n", buf);
-			// convert it into a IoTHub message (copy number 2)
-			IOTHUB_MESSAGE_HANDLE message_handle = IoTHubMessage_CreateFromString(buf);
-			if (message_handle == NULL) {
-				Log_Debug("Unable to create message handle\n");
-				q_enqueue(&pkt_to_send_queue, buf);
-				goto cleanup;
-			}
-			// send the message to the IoTHub (copy number 3)
-			if (IoTHubDeviceClient_LL_SendEventAsync(data->iot_handle, message_handle, upload_msg_cb, NULL) != IOTHUB_CLIENT_OK) {
-				Log_Debug("WARNING: failed to hand over the message to IoTHubClient\n");
-				q_enqueue(&pkt_to_send_queue, buf);
-
-				pthread_mutex_lock(&state_transition_lock);
-				{
-					desired_state = STATE_NO_CREDS;
-					uev_event_post(data->move_state_w);
-				}
-				pthread_mutex_unlock(&state_transition_lock);
-			}
-			else {
-				// add the message to the "sent" buffer, and restart the cycle!
-				q_enqueue(&pkt_sent_queue, buf);
-			}
-			// remove copy #2
-			IoTHubMessage_Destroy(message_handle);
-		}
-	}
 cleanup:
-	pthread_mutex_unlock(&pkt_queue_lock);
+    pthread_mutex_unlock(&app_state->pkt_queues_lock);
 }
 
-void poll_sensors(uev_t* w, void* arg, int events) {
-	on_net_rdy_t* data = (on_net_rdy_t*)arg;
+void handle_do_work(EventLoopTimer* timer, void* ctx) {
+    application_state_t* app_state = (application_state_t*)ctx;
+    if (ConsumeEventLoopTimerEvent(timer) != 0) {
+        app_panic(app_state, ExitCode_ConsumeEventLoopTimerEvent);
+        return;
+    }
 
-	if (UEV_ERROR == events) {
-		Log_Debug("Error in poll_sensors event\n");
-		uev_timer_stop(data->poll_sensors_w);
-		struct timespec now;
-		clock_gettime(CLOCK_REALTIME, &now);
-		time_t next_trigger = now.tv_sec + sample_interval;
-		next_trigger -= (next_trigger % sample_interval);
-		uev_timer_set(data->poll_sensors_w, (next_trigger - now.tv_sec) * 1000, sample_interval * 1000);
-		uev_timer_start(data->poll_sensors_w);
-	}
-	else {
-		// read sensors
-		struct timespec time;
-		uint32_t adc_value = 0U;
-		climate_data_t climate_sample;
-		soil_data_t soil_sample;
-		humidity_data_t humid_sample;
-		clock_gettime(CLOCK_REALTIME, &time);
-		ADC_Poll(data->fds->ADC, LIGHT_ADC_CHANNEL, &adc_value);
-		float lux = (2.5f * (float)adc_value / 4095.0f) * 1000000.0f / (3650.0f * 0.1428f);
-		ClimateSensorMeasure(&climate_sample);
-		SoilMoistureMeasure(&soil_sample);
-		HumidityMeasure(&humid_sample);
-		// serialize sensor data (copy number 1)
-		char* buffer = malloc(packet_max);
-		int res = snprintf(buffer, packet_max, data_fmt, 
-			time.tv_sec, 
-			lux, 
-			climate_sample.avg_tempurature, 
-			climate_sample.avg_pressure, 
-			climate_sample.num_samples,
-			soil_sample.soil_moisture_24,
-			soil_sample.soil_moisture_26,
-			humid_sample.humidity);
-		if (res < 0) {
-			Log_Debug("Snprintf failed\n");
-			free(buffer);
-			return;
-		}
-		else
-			Log_Debug("Sampled message:\"%s\"\n", buffer);
-		// add message to sending queue
-		bool status;
-		size_t count = 0;
-		pthread_mutex_lock(&pkt_queue_lock);
-		{
-			status = q_enqueue(&pkt_to_send_queue, buffer);
-			// if the number of elements in the queue > 10, tell the device it's time to send
-			count = q_count(&pkt_to_send_queue);
-		}
-		pthread_mutex_unlock(&pkt_queue_lock);
-		if (!status) {
-			Log_Debug("Memory queue full!\n");
-			terminationRequired = true;
-		}
-		// if there are more than ten elements, move from idle to start
-		if (count >= 10) {
-			pthread_mutex_lock(&state_transition_lock);
-			{
-				if (cur_state == STATE_IDLE) {
-					desired_state = STATE_NO_NETWORK;
-					uev_event_post(data->move_state_w);
-				}
-			}
-			pthread_mutex_unlock(&state_transition_lock);
-		}
-	}
+    IoTHubDeviceClient_LL_DoWork(app_state->iothub_handle);
 }
 
-void do_work(uev_t* w, void* arg, int events) {
-	on_net_rdy_t* data = (on_net_rdy_t*)arg;
-	if (data->iot_handle) {
-		IoTHubDeviceClient_LL_DoWork(data->iot_handle);
-	}
+void handle_sample(EventLoopTimer* timer, void* ctx) {
+    application_state_t* app_state = (application_state_t*)ctx;
+    if (ConsumeEventLoopTimerEvent(timer) != 0) {
+        app_panic(app_state, ExitCode_ConsumeEventLoopTimerEvent);
+        return;
+    }
+    
+    if (pthread_mutex_lock(&app_state->pkt_queues_lock)) {
+        app_panic(app_state, ExitCode_lock_fail);
+        return;
+    }
+
+    if (deque_count(app_state->pkt_outbound) >= QueueMaxCapacity) {
+        app_panic(app_state, ExitCode_QueueOverfill);
+        goto cleanup;
+    }
+
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    sensor_values_t sample = sample_sensors(&app_state->sensors);
+    IOTHUB_MESSAGE_HANDLE handle = serialize_sensor_data(&sample, &time);
+
+    if (handle == NULL) {
+        // TODO: should panic here or not?
+        Log_Debug("Failed to serialize sensor readings\n");
+        goto cleanup;
+    }
+
+    Log_Debug("Queueing message with body \"%s\"\n", IoTHubMessage_GetString(handle));
+    if (!deque_push_back(app_state->pkt_outbound, handle)) {
+        app_panic(app_state, ExitCode_QueueingFailed);
+        IoTHubMessage_Destroy(handle);
+    }
+
+cleanup:
+    pthread_mutex_unlock(&app_state->pkt_queues_lock);
+}
+
+void sigterm_handler(int signalNumber) {
+    if (sigterm_event)
+        PostEventLoopEvent(sigterm_event);
+}
+
+void handle_sigterm_event(EventLoopEvent_t* event, void* ctx) {
+    application_state_t* app_state = (application_state_t*)ctx;
+    eventfd_t out = 0;
+    ConsumeEventLoopEvent(event, &out);
+
+    Log_Debug("Got SIGTERM, aborting...\n");
+    EventLoop_Stop(app_state->loop);
+}
+
+ExitCode init_application(application_state_t* state) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(struct sigaction));
+    action.sa_handler = sigterm_handler;
+    sigaction(SIGTERM, &action, NULL);
+
+    pthread_mutex_init(&state->pkt_queues_lock, NULL);
+    state->pkt_outbound = deque_new(QueueMaxCapacity, &(struct deque_fval){ 0 });
+    if (state->pkt_outbound == NULL)
+        return ExitCode_deque_new_outbound;
+    state->pkt_in_flight = deque_new(QueueMaxCapacity, &(struct deque_fval){ 0 });
+    if (state->pkt_in_flight == NULL)
+        return ExitCode_deque_new_in_flight;
+
+    state->loop = EventLoop_Create();
+    if (state->loop == NULL)
+        return ExitCode_EventLoop_Create;
+
+    state->last_thread_exit_code = ExitCode_Success;
+    state->sigterm_event = CreateEventLoopEvent(state->loop, handle_sigterm_event, state);
+    if (state->sigterm_event == NULL)
+        return ExitCode_CreateEventLoopEvent_Panic;
+    sigterm_event = state->sigterm_event;
+    
+    state->state_transition_event = CreateEventLoopEvent(state->loop, handle_state_transition, state);
+    if (state->state_transition_event == NULL)
+        return ExitCode_CreateEventLoopEvent_StateTransition;
+
+    state->no_network_timer = CreateEventLoopDisarmedTimer(state->loop, handle_no_network, state);
+    if (state->no_network_timer == NULL)
+        return ExitCode_CreateEventLoopDisarmedTimer_NetRdy;
+    state->azure_auth_timer = CreateEventLoopDisarmedTimer(state->loop, handle_azure_auth, state);
+    if (state->azure_auth_timer == NULL)
+        return ExitCode_CreateEventLoopDisarmedTimer_AzureAuth;
+    state->upload_timer = CreateEventLoopDisarmedTimer(state->loop, handle_upload, state);
+    if (state->upload_timer == NULL)
+        return ExitCode_CreateEventLoopDisarmedTimer_Upload;
+    state->dowork_timer = CreateEventLoopDisarmedTimer(state->loop, handle_do_work, state);
+    if (state->dowork_timer == NULL)
+        return ExitCode_CreateEventLoopDisarmedTimer_DoWork;
+
+    state->sample_timer = CreateEventLoopPeriodicTimer(state->loop, handle_sample, state, &SampleInterval);
+    if (state->sample_timer == NULL)
+        return ExitCode_CreateEventLoopPeriodicTimer_Sample;
+
+    APP_REQUEST_TRANSITION(state, State_NoNetwork);
+
+    return ExitCode_Success;
+}
+
+ExitCode run_application(application_state_t* state) {
+    // Main loop
+    while (state->last_thread_exit_code == ExitCode_Success) {
+        EventLoop_Run_Result result = EventLoop_Run(state->loop, -1, false);
+        // Continue if interrupted by signal, e.g. due to breakpoint being set.
+        if (result == EventLoop_Run_Failed && errno != EINTR) {
+            return ExitCode_EventLoopFail;
+        }
+    }
+    return state->last_thread_exit_code;
+}
+
+void destroy_pkt_deque(deque_t* pkt_d) {
+    while (!deque_empty(pkt_d)) {
+        IoTHubMessage_Destroy(deque_front(pkt_d));
+        deque_pop_front(pkt_d);
+    }
+    deque_free(pkt_d);
+}
+
+void destroy_application(application_state_t* state) {
+    if (state->state_transition_event)
+        DisposeEventLoopEvent(state->state_transition_event);
+    if (state->sigterm_event) {
+        DisposeEventLoopEvent(state->sigterm_event);
+        sigterm_event = NULL;
+    }
+    if (state->no_network_timer)
+        DisposeEventLoopTimer(state->no_network_timer);
+    if (state->azure_auth_timer)
+        DisposeEventLoopTimer(state->azure_auth_timer);
+    if (state->upload_timer)
+        DisposeEventLoopTimer(state->upload_timer);
+    if (state->dowork_timer)
+        DisposeEventLoopTimer(state->dowork_timer);
+    if (state->sample_timer)
+        DisposeEventLoopTimer(state->sample_timer);
+    if (state->loop)
+        EventLoop_Close(state->loop);
+    if (state->iothub_handle)
+        IoTHubDeviceClient_LL_Destroy(state->iothub_handle);
+
+    if (state->pkt_outbound)
+        destroy_pkt_deque(state->pkt_outbound);
+    if (state->pkt_in_flight)
+        destroy_pkt_deque(state->pkt_in_flight);
+    pthread_mutex_destroy(&state->pkt_queues_lock);
+
+    stop_system_devices(&state->sensors.fds);
+    zero_application_state(state);
 }
 
 int main(void)
 {
-	fd_t fds;
-	// pulse_t app_pulse, wlan_pulse;
-	uev_ctx_t ctx;
-	uev_t sigterm_watcher, state_change_watcher, upload_timer_watcher, poll_sensors_watcher, do_work_watcher;
-	poll_t net_rdy_poll, azure_rdy_poll;
-	on_net_rdy_t on_net_rdy_arg;
+    application_state_t app_state;
+    zero_application_state(&app_state);
+    
+    Log_Debug("Booting up!\n");
 
-	// startup and clear the queue
-	pkt_to_send_queue = q_new();
-	pkt_sent_queue = q_new();
-	pthread_mutex_init(&pkt_queue_lock, NULL);
-	pthread_mutex_init(&state_transition_lock, NULL);
+    Log_Debug("Initializing peripherals...");
+    ExitCode exit = start_peripherals(&app_state);
+    if (exit != ExitCode_Success)
+        goto fail;
+    Log_Debug("done\n");
 
-	// open and reset all peripheraals
-	OpenPeripherals(&fds);
+    Log_Debug("Starting application handlers...");
+    exit = init_application(&app_state);
+    if (exit != ExitCode_Success)
+        goto fail;
+    Log_Debug("done\n");
 
-	// configure events
-	// pulse_configure(&app_pulse, fds.Status_PWM, APP_STATUS_PWM_CHANNEL, 100000, 80000, 5000, 100);
-	// pulse_configure(&wlan_pulse, fds.Status_PWM, WLAN_STATUS_PWM_CHANNEL, 100000, 80000, 5000, 100);
-	on_net_rdy_arg.ctx = &ctx;
-	on_net_rdy_arg.move_state_w = &state_change_watcher;
-	on_net_rdy_arg.upload_timer_w = &upload_timer_watcher;
-	on_net_rdy_arg.poll_sensors_w = &poll_sensors_watcher;
-	on_net_rdy_arg.fds = &fds;
-	// on_net_rdy_arg.app_pulse = &app_pulse;
-	// on_net_rdy_arg.wlan_pulse = &wlan_pulse;
-	on_net_rdy_arg.net_rdy_poll = &net_rdy_poll;
-	on_net_rdy_arg.azure_rdy_poll = &azure_rdy_poll;
-	on_net_rdy_arg.iot_handle = NULL;
-	on_net_rdy_arg.iot_scope_id = iot_scope_id;
-	poll_configure(&net_rdy_poll, check_net_rdy, &on_net_rdy_arg, NULL, 1000);
-	poll_configure(&azure_rdy_poll, check_azure_rdy, &on_net_rdy_arg, NULL, 1000);
+    Log_Debug("Welcome azure sphere plant monitor!\n");
+    exit = run_application(&app_state);
 
-	Log_Debug("Initializing uev event loop...\n");
-
-	uev_init(&ctx);
-	uev_signal_init(&ctx, &sigterm_watcher, cleanup_exit, NULL, SIGTERM);
-	uev_event_init(&ctx, &state_change_watcher, move_state, &on_net_rdy_arg);
-	uev_timer_init(&ctx, &upload_timer_watcher, upload_data, &on_net_rdy_arg, 100, UEV_NONE);
-	uev_timer_stop(&upload_timer_watcher);
-	// start the internet event chain
-	desired_state = STATE_IDLE;
-	uev_event_post(&state_change_watcher);
-	// and the sensor event chain, which will run concurrently
-	struct timespec now;
-	clock_gettime(CLOCK_REALTIME, &now);
-	time_t next_trigger = now.tv_sec + sample_interval;
-	next_trigger -= (next_trigger % sample_interval);
-	uev_timer_init(&ctx, &poll_sensors_watcher, poll_sensors, &on_net_rdy_arg, (next_trigger - now.tv_sec) * 1000, sample_interval * 1000);
-	uev_timer_init(&ctx, &do_work_watcher, do_work, &on_net_rdy_arg, 100, 100);
-
-	while (!terminationRequired && uev_run(&ctx, 0) >= 0);
-	
-	Log_Debug("Exiting...\n");
-	
-	uev_exit(&ctx);
-	pthread_mutex_destroy(&state_transition_lock);
-	pthread_mutex_destroy(&pkt_queue_lock);
-	return 0;
+fail:
+    Log_Debug("\nRunning failed with exit code %i and errno %s\n", exit, strerror(errno));
+    destroy_application(&app_state);
+    return exit;
 }

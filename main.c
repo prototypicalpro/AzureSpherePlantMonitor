@@ -279,6 +279,7 @@ void azure_status_cb(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLIENT_CONNE
 {
 	on_net_rdy_t* data = (on_net_rdy_t*)userContextCallback;
 	int next_state = 0;
+	// TODO: add other enum values to if statements
 	if (result == IOTHUB_CLIENT_CONNECTION_UNAUTHENTICATED) {
 		if (reason == IOTHUB_CLIENT_CONNECTION_NO_NETWORK) {
 			// restart network polling, indicating as such
@@ -304,12 +305,15 @@ void azure_status_cb(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLIENT_CONNE
 }
 
 int check_azure_rdy(uev_t* w, void* arg, int events) {
+	// TODO: handle errors gracefully
 	if (UEV_ERROR == events)
 		Log_Debug("Error in check_azure_rdy event\n");
 	else {
 		on_net_rdy_t* data = (on_net_rdy_t*)arg;
-		if (data->iot_handle != NULL)
+		if (data->iot_handle != NULL) {
 			IoTHubDeviceClient_LL_Destroy(data->iot_handle);
+			data->iot_handle = NULL;
+		}
 
 		AZURE_SPHERE_PROV_RETURN_VALUE provResult =
 			IoTHubDeviceClient_LL_CreateWithAzureSphereDeviceAuthProvisioning(data->iot_scope_id, 10000,

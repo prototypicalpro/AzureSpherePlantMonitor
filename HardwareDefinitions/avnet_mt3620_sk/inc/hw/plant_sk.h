@@ -41,7 +41,7 @@
 #define LIGHT_ADC_CONTROLLER AVNET_MT3620_SK_ADC_CONTROLLER0
 
 // MT3620 SK: Connect external potentiometer to ADC controller 0, channel 1 using SOCKET1 AN. In the app manifest, it is only necessary to request the capability for the ADC Group Controller, SAMPLE_POTENTIOMETER_ADC_CONTROLLER.
-#define LIGHT_ADC_CHANNEL MT3620_ADC_CHANNEL1
+#define LIGHT_ADC_CHANNEL MT3620_ADC_CHANNEL0
 
 // ISU2 I2C is shared between GROVE Connector, OLED DISPLAY Connector, SOCKET1 and SOCKET2. On GROVE Connector: pin 15 (SDA) and pin 10 (SCL). On OLED Display connector: pin 4 (SDA) and pin 3 (SCL).On SOCKET1/2: SDA (SDA) and SCL (SCL)
 #define CLIMATE_I2C_CONTROLLER AVNET_AESMS_ISU2_I2C

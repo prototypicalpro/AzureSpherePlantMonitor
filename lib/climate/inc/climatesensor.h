@@ -13,8 +13,8 @@
 #include <stdbool.h>
 
 typedef struct {
-	float avg_tempurature;
-	float avg_pressure;
+	double avg_tempurature;
+	double avg_pressure;
 	int num_samples;
 } climate_data_t;
 

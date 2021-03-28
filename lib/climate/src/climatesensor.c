@@ -6,8 +6,8 @@ typedef struct {
 } handle_ctx_t;
 
 typedef struct {
-	float temp;
-	float pressure;
+	double temp;
+	double pressure;
 } climate_sample_t;
 
 /*
@@ -157,8 +157,8 @@ int ClimateSensorMeasure(climate_t* climate, climate_data_t* data_out) {
 	}
 
 	int cached_level = fifo_level;
-	float float_cached_level = (float)fifo_level;
-	climate_sample_t total = {};
+	double float_cached_level = (double)fifo_level;
+	climate_sample_t total = { .pressure = 0, .temp = 0 };
 
 	while (fifo_level) {
 		static axis1bit32_t data_raw_pressure;
@@ -167,8 +167,8 @@ int ClimateSensorMeasure(climate_t* climate, climate_data_t* data_out) {
 		lps22hh_pressure_raw_get(&climate->_press_ctx, data_raw_pressure.u8bit);
 		lps22hh_temperature_raw_get(&climate->_press_ctx, data_raw_temperature.u8bit);
 
-		float pressure_hPa = lps22hh_from_lsb_to_hpa(data_raw_pressure.i32bit);
-		float lps22hhTemperature_degC = lps22hh_from_lsb_to_celsius(data_raw_temperature.i16bit);
+		double pressure_hPa = lps22hh_from_lsb_to_hpa(data_raw_pressure.i32bit);
+		double lps22hhTemperature_degC = lps22hh_from_lsb_to_celsius(data_raw_temperature.i16bit);
 
 		total.temp += lps22hhTemperature_degC;
 		total.pressure += pressure_hPa;

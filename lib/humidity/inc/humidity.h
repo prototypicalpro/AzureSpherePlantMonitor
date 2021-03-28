@@ -10,7 +10,7 @@
 #include <applibs/log.h>
 
 typedef struct {
-	float humidity;
+	double humidity;
 } humidity_data_t;
 
 typedef struct {

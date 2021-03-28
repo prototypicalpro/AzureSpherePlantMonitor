@@ -51,7 +51,7 @@ int HumidityMeasure(humidity_t* humidity, humidity_data_t* data_out) {
 	}
 	// translate the humidity bytes (3-4) into a float
 	uint16_t humid = (uint16_t)((out[3] << 8) | out[4]);
-	data_out->humidity = 100.0f * (float)humid / 65535.0f;
+	data_out->humidity = 100.0 * (double)humid / 65535.0;
 	return 0;
 }
 

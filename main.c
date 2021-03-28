@@ -46,6 +46,7 @@ const struct timespec IoTDoWorkInterval = { .tv_sec = 0, .tv_nsec = 5e7 }; // 50
 const struct timespec SoonInterval = { .tv_sec = 0, .tv_nsec = 1 };
 const size_t PacketMaxBytes = 256;
 const size_t QueueMaxCapacity = 50;
+const size_t AdcSampleCount = 100;
 
 typedef enum {
     State_Entry = 0,
@@ -128,7 +129,7 @@ typedef struct {
     humidity_data_t humidity_data;
     chirp_data_t soil_1_data;
     chirp_data_t soil_2_data;
-    float lux;
+    double lux;
 } sensor_values_t;
 
 typedef struct {
@@ -239,10 +240,21 @@ sensor_values_t sample_sensors(sensors_t* sensors) {
     ChirpMeasure(&sensors->soil_moisture_1, &ret.soil_1_data);
     ChirpMeasure(&sensors->soil_moisture_2, &ret.soil_2_data);
     
-    uint32_t adc_value;
-    int err = ADC_Poll(sensors->fds.adc, LIGHT_ADC_CHANNEL, &adc_value);
-    if (!err) 
-        ret.lux = (2.5f * (float)adc_value / 4095.0f) * 1000000.0f / (3650.0f * 0.1428f);
+    uint64_t sum = 0;
+    size_t sample_count = 0;
+    for (size_t i = 0; i < AdcSampleCount; i++) {
+        uint32_t adc_value;
+        int err = ADC_Poll(sensors->fds.adc, LIGHT_ADC_CHANNEL, &adc_value);
+        if (!err) {
+            sum += adc_value;
+            sample_count++;
+        }
+    }
+
+    if (sample_count > 0) {
+        const double avg = (double)sum / (double)sample_count;
+        ret.lux = (2.5 * avg / 4095.0) * 1000000.0 / (3650.0 * 0.1428);
+    }
     else 
         ret.lux = 0;
 

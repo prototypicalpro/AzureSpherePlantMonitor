@@ -40,6 +40,7 @@ int ChirpMeasure(chirp_t* chirp, chirp_data_t* data_out) {
 	swap(out.u8bit, out.u8bit + 1);
 	if (ret < 0 || out.u16bit > 10000U) {
 		Log_Debug("Soil sensor with addr %i not found!\n", chirp->_addr);
+		chirp->_is_active = false;
 		return -1;
 	}
 	data_out->soil_moisture = out.u16bit;

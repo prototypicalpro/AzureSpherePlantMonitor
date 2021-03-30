@@ -39,7 +39,7 @@
 const char IotHubHostname[] = "plantmonitor.azure-devices.net";
 const char PacketFmt[] = "{\"meta\":{\"time\":%d,\"name\":\"plant0\"},\"data\":{\"lux\":%f,\"climate\":{\"tempurature\":%f,\"pressure\":%f,\"samples\":%d},\"soil\":{\"0x24\":%hu,\"0x26\":%hu},\"humidity\":%f}}";
 const struct timespec UploadInterval = { .tv_sec = 600, .tv_nsec = 0 }; // TODO: every ten minutes
-const struct timespec SampleInterval = { .tv_sec = 120, .tv_nsec = 0 }; // TODO: every two minutes
+const struct timespec SampleInterval = { .tv_sec = 60, .tv_nsec = 0 }; // TODO: every minute
 const struct timespec NetPollInterval = { .tv_sec = 5, .tv_nsec = 0 };
 const struct timespec AzureAuthPollInterval = { .tv_sec = 30, .tv_nsec = 0 };
 const struct timespec IoTDoWorkInterval = { .tv_sec = 0, .tv_nsec = 5e7 }; // 50 milliseconds
@@ -261,6 +261,13 @@ sensor_values_t sample_sensors(sensors_t* sensors) {
     return ret;
 }
 
+bool sensors_ok(sensors_t* sensors) {
+    return ClimateSensorIsOk(&sensors->climate)
+        && HumidityIsOk(&sensors->humidity) 
+        && ChirpIsOk(&sensors->soil_moisture_1) 
+        && ChirpIsOk(&sensors->soil_moisture_2);
+}
+
 IOTHUB_MESSAGE_HANDLE serialize_sensor_data(const sensor_values_t* values, const struct timespec* time) {
     char pkt[PacketMaxBytes];
     int res = snprintf(pkt, PacketMaxBytes, PacketFmt,
@@ -344,7 +351,7 @@ void handle_state_transition(EventLoopEvent_t* event, void* ctx) {
             SetEventLoopTimerPeriod(app_state->no_network_timer, &SoonInterval, &NetPollInterval);
             break;
         case State_AzureAuth:
-            set_indicator_color(app_state->sensors.fds.user_pwm, 255, 128, 0);
+            set_indicator_color(app_state->sensors.fds.user_pwm, 0, 0, 255);
             SetEventLoopTimerPeriod(app_state->azure_auth_timer, &SoonInterval, &AzureAuthPollInterval);
             SetEventLoopTimerPeriod(app_state->dowork_timer, &SoonInterval, &IoTDoWorkInterval);
             break;
@@ -528,7 +535,9 @@ void handle_sample(EventLoopTimer* timer, void* ctx) {
         app_panic(app_state, ExitCode_ConsumeEventLoopTimerEvent);
         return;
     }
-    
+
+    start_or_restart_sensors(&app_state->sensors);
+
     if (pthread_mutex_lock(&app_state->pkt_queues_lock)) {
         app_panic(app_state, ExitCode_lock_fail);
         return;
@@ -555,6 +564,11 @@ void handle_sample(EventLoopTimer* timer, void* ctx) {
         app_panic(app_state, ExitCode_QueueingFailed);
         IoTHubMessage_Destroy(handle);
     }
+
+    if (sensors_ok(&app_state->sensors))
+        set_indicator_color(app_state->sensors.fds.user_pwm, 0, 255, 0);
+    else
+        set_indicator_color(app_state->sensors.fds.user_pwm, 255, 128, 0);
 
 cleanup:
     pthread_mutex_unlock(&app_state->pkt_queues_lock);

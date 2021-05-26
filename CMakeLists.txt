@@ -6,7 +6,7 @@ cmake_minimum_required (VERSION 3.10)
 project (PlantMonitor C)
 
 azsphere_configure_tools(TOOLS_REVISION "21.01")
-azsphere_configure_api(TARGET_API_SET "8")
+azsphere_configure_api(TARGET_API_SET "9")
 
 # Create executable
 file(GLOB LIB_SRC lib/*/src/*.c)
